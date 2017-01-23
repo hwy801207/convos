@@ -62,6 +62,9 @@ has _irc => sub {
   return $irc;
 };
 
+# room list is shared between all connections
+has _room_cache => sub { state $cache = {} };
+
 sub connect {
   my ($self, $cb) = @_;
   my $irc      = $self->_irc;
@@ -145,25 +148,6 @@ sub participants {
   );
 }
 
-sub rooms {
-  my ($self, $cb) = @_;
-  my $host = $self->url->host;
-
-  state $cache = {};    # room list is shared between all connections
-  return next_tick $self, $cb, '', $cache->{$host} if $cache->{$host};
-
-  Scalar::Util::weaken($self);
-  return $self->_proxy(
-    channels => sub {
-      my ($irc, $err, $map) = @_;
-      $cache->{$host} = [map { my $c = $map->{$_}; $c->{name} = $_; $c } keys %$map];
-      delete $cache->{$host} unless @{$cache->{$host}};
-      Mojo::IOLoop->timer(ROOM_CACHE_TIMER, sub { delete $cache->{$host} });
-      $self->$cb($cache->{$host} ? $err : 'No rooms.', $cache->{$host} || []);
-    },
-  );
-}
-
 sub send {
   my ($self, $target, $message, $cb) = @_;
 
@@ -186,9 +170,10 @@ sub send {
   return $self->participants($target, $cb) if $cmd eq 'NAMES';
   return $self->nick($message, $cb) if $cmd eq 'NICK';
   return $self->_part_dialog($message || $target, $cb) if $cmd eq 'CLOSE' or $cmd eq 'PART';
+  return $self->_rooms($message, $cb) if $cmd eq 'LIST';
   return $self->_topic($target, $message, $cb) if $cmd eq 'TOPIC';
   return $self->_proxy(whois => $message, $cb) if $cmd eq 'WHOIS';
-  return $self->_proxy(write => "$cmd $message", sub { $self->$cb($_[1]); });
+  return $self->_proxy(write => "$cmd $message", sub { $self->$cb($_[1], {}); });
 }
 
 sub _event_close {
@@ -300,6 +285,19 @@ sub _proxy {
   my ($self, $method) = (shift, shift);
   $self->_irc->$method(@_);
   $self;
+}
+
+sub _rooms {
+  my ($self, $args, $cb) = @_;
+  my $host  = $self->url->host;
+  my $cache = $self->_room_cache->{$host};
+
+  unless ($cache) {
+    $cache = $self->_room_cache->{$host} = [];
+    $self->_irc->write(Parse::IRC::parse_irc('LIST'));
+  }
+
+  return next_tick $self, $cb, '', $cache;
 }
 
 sub _send {
@@ -510,6 +508,23 @@ sub _event_quit {
   $self->emit(state => quit => {nick => $nick, message => join ' ', @{$msg->{params}}});
 }
 
+sub _event_rpl_list {
+  my ($self, $msg) = @_;
+  my $host = $self->url->host;
+  my $room = {name => $msg->{params}[1], n_users => $msg->{params}[2], topic => $msg->{params}[3]};
+
+  $room->{topic} =~ s!^\[\+[a-z]+\]\s?!!;    # remove mode from topic, such as [+nt]
+  push @{$self->_room_cache->{$host}}, $room;
+  $self->emit(room => $room);
+}
+
+sub _event_rpl_listend {
+  my ($self, $msg) = @_;
+  my $host = $self->url->host;
+  push @{$self->_room_cache->{$host}}, undef;
+  $self->emit(channel => undef);
+}
+
 # :hybrid8.debian.local 004 superman hybrid8.debian.local hybrid-1:8.2.0+dfsg.1-2 DFGHRSWabcdefgijklnopqrsuwxy bciklmnoprstveIMORS bkloveIh
 sub _event_rpl_myinfo {
   my ($self, $msg) = @_;
@@ -614,10 +629,6 @@ L</nick>.
 =head2 participants
 
 See L<Convos::Core::Connection/participants>.
-
-=head2 rooms
-
-See L<Convos::Core::Connection/rooms>.
 
 =head2 send
 
